@@ -12,6 +12,68 @@ let _mitSim      = null;
 
 function mitGetTF() { return document.getElementById('mitTfSelect').value; }
 
+// ═══════════════════════════════════════════════════════════════
+// IGNITION HELPERS — all work on candle arrays already fetched
+// Zero extra API calls
+// ═══════════════════════════════════════════════════════════════
+
+// 3-candle sequential volume growth: Vol[n] > Vol[n-1] > Vol[n-2]
+// Returns { isAccelerating, accelerationRatio, powerLevel }
+function detectVolumeAcceleration(candles) {
+  if (!candles || candles.length < 4) return { isAccelerating:false, accelerationRatio:0, powerLevel:'NONE' };
+  const n  = candles.length;
+  const v3 = candles[n-1].vol; // current (may be active/partial)
+  const v2 = candles[n-2].vol; // last closed
+  const v1 = candles[n-3].vol; // pre-previous closed
+  const isAccelerating = v3 > v2 && v2 > v1 && v1 > 0;
+  const accelerationRatio = isAccelerating && v1 > 0 ? v3 / v1 : 0;
+  let powerLevel = 'NONE';
+  if (isAccelerating) {
+    if (accelerationRatio >= 2.5)     powerLevel = 'IGNITION';
+    else if (accelerationRatio >= 1.5) powerLevel = 'FUELING';
+    else                               powerLevel = 'BUILDING';
+  }
+  return { isAccelerating, accelerationRatio, powerLevel };
+}
+
+// Expansion candle: body is 2.5x+ the avg body of last 5 candles
+// Indicates sellers cleared, price moving through a liquidity void
+function detectLiquidityVoid(candles) {
+  if (!candles || candles.length < 7) return { hasVoid:false, expansionRatio:0 };
+  const n        = candles.length;
+  const last     = candles[n-1];
+  const bodySize = Math.abs(last.close - last.open);
+  const avgBody  = candles.slice(-6,-1).reduce((a,c) => a + Math.abs(c.close - c.open), 0) / 5;
+  const expansionRatio = avgBody > 0 ? bodySize / avgBody : 0;
+  return { hasVoid: expansionRatio >= 2.5, expansionRatio };
+}
+
+// RS Alpha: coin ROC vs BTC ROC across last 3 candles
+// Positive = coin outperforming BTC = institutional interest
+// btcCandles passed in (already fetched once per Phase 3 run)
+function calculateRSAlpha(candles, btcCandles) {
+  if (!candles || candles.length < 4 || !btcCandles || btcCandles.length < 4)
+    return { rsAlpha:0, rsAccelerating:false };
+  const n   = candles.length;
+  const nb  = btcCandles.length;
+  // ROC over each of last 3 candles vs their prior
+  const coinRocs = [
+    (candles[n-3].close - candles[n-4]?.close) / (candles[n-4]?.close||1) * 100,
+    (candles[n-2].close - candles[n-3].close)  / candles[n-3].close * 100,
+    (candles[n-1].close - candles[n-2].close)  / candles[n-2].close * 100,
+  ];
+  const btcRocs = [
+    (btcCandles[nb-3].close - btcCandles[nb-4]?.close) / (btcCandles[nb-4]?.close||1) * 100,
+    (btcCandles[nb-2].close - btcCandles[nb-3].close)  / btcCandles[nb-3].close * 100,
+    (btcCandles[nb-1].close - btcCandles[nb-2].close)  / btcCandles[nb-2].close * 100,
+  ];
+  const alphas = coinRocs.map((r,i) => r - btcRocs[i]);
+  const rsAlpha = alphas[2]; // latest candle alpha
+  // Accelerating RS: each alpha bigger than last
+  const rsAccelerating = alphas[2] > alphas[1] && alphas[1] > alphas[0];
+  return { rsAlpha, rsAccelerating, alphas };
+}
+
 function mitSetPhase(n) {
   for (let i = 1; i <= 4; i++) {
     const pill  = document.getElementById('mphase-' + i);
@@ -69,7 +131,7 @@ async function phase1_surge(allSymbols, tf) {
     const spreadPct  = spotMap[sym + 'USDT'] > 0
       ? Math.abs((price - spotMap[sym + 'USDT']) / spotMap[sym + 'USDT']) * 100 : 0;
     const rocPass    = priceChg >= 1.5;
-    const spreadPass = spreadPct > 0.05;
+    const spreadPass = spreadPct > 0.1; // tightened: 0.1%+ = aggressive leveraged longs chasing
     if (rocPass || spreadPass)
       candidates.push({ symbol:sym, price, priceChg, vol24h, spreadPct, rocPass, spreadPass });
   }
@@ -101,6 +163,20 @@ async function phase1_surge(allSymbols, tf) {
           ? Math.abs((closes[closes.length-1]-closes[closes.length-6])/closes[closes.length-6]*100) : 0;
         c.recentRoc = recentRoc;
         c.rocPass   = c.rocPass || recentRoc >= 2.0;
+
+        // Volume acceleration — free, using klines already fetched
+        const candlesFromKlines = klines.map(k => ({
+          open:parseFloat(k[1]),high:parseFloat(k[2]),
+          low:parseFloat(k[3]),close:parseFloat(k[4]),vol:parseFloat(k[5])
+        }));
+        const volAccel = detectVolumeAcceleration(candlesFromKlines);
+        c.volAccel    = volAccel;
+        c.powerLevel  = volAccel.powerLevel;
+
+        // Liquidity void — expansion candle check
+        const liqVoid = detectLiquidityVoid(candlesFromKlines);
+        c.hasLiqVoid  = liqVoid.hasVoid;
+        c.expansionRatio = liqVoid.expansionRatio;
 
         const passes = (c.rvolPass?1:0)+(c.rocPass?1:0)+(c.spreadPass?1:0);
         if (passes >= 1) { c.surgeScore = passes; survivors.push(c); }
@@ -158,6 +234,15 @@ async function phase2_structure(survivors, tf) {
 
         if (!hasDirBOS) return;
 
+        // Anti-dump filter: if vol accelerating INTO a POI (not away from it), it's exhaustion
+        const volAccel2 = detectVolumeAcceleration(candles);
+        const liqVoid2  = detectLiquidityVoid(candles);
+        // Exhaustion: vol accelerating but price moving INTO supply/demand zone against bias
+        const isExhaustion = volAccel2.isAccelerating &&
+          ((isBull  && inPremium)  ||   // bull but price at premium = buying exhaustion
+           (!isBull && inDiscount));     // bear but price at discount = selling exhaustion
+        if (isExhaustion) return; // hard reject — this is a wall, not a launch
+
         const reasons = [];
         if (isBull  && struct.recentCHOCH_up)   reasons.push(`CHoCH confirmed bullish on ${tf}`);
         if (isBull  && struct.recentBOS_up)      reasons.push(`BOS break upside on ${tf}`);
@@ -175,6 +260,7 @@ async function phase2_structure(survivors, tf) {
 
         qualified.push({ ...c, isBull, price, reasons, setupType,
           hasDirBOS, hasDirZone, hasDirFVG, hasSweep, hasLiq,
+          volAccel2, liqVoid2,
           structScore:[hasDirBOS,hasDirZone,hasDirFVG,hasSweep,hasLiq].filter(Boolean).length });
       } catch(e) {}
     }));
@@ -192,10 +278,12 @@ async function phase3_confluence(structQualified, tf) {
   const final = [];
 
   let btcRoc = 0;
+  let btcCandles = null;
   try {
-    const btc = await fetchBinanceCandles('BTC', tf, 10);
-    if (btc && btc.length >= 6)
-      btcRoc = (btc[btc.length-1].close - btc[btc.length-6].close) / btc[btc.length-6].close * 100;
+    btcCandles = await fetchBinanceCandles('BTC', tf, 12);
+    if (btcCandles && btcCandles.length >= 6)
+      btcRoc = (btcCandles[btcCandles.length-1].close - btcCandles[btcCandles.length-6].close)
+               / btcCandles[btcCandles.length-6].close * 100;
   } catch(e) {}
   const btcBearish = btcRoc < -1.5;
 
@@ -255,6 +343,37 @@ async function phase3_confluence(structQualified, tf) {
           ? ['strong_long','short_cover','unknown'].includes(oiDirection)
           : ['strong_short','long_cover','unknown'].includes(oiDirection);
 
+        // ── RS Alpha: coin outperformance vs BTC across 3 candles ──
+        // Uses candle data already in the coin object (recentRoc) + btcCandles fetched once
+        const rsData = calculateRSAlpha(
+          // rebuild minimal candle-like array from what we have
+          // We don't have per-coin candles here — use the volAccel2 candles stored from Phase 2
+          // For RS we use the simple scalar already computed
+          null, btcCandles
+        );
+        // Simple RS: coin 5-candle ROC minus BTC 5-candle ROC
+        const coinRoc5 = c.recentRoc || 0;
+        const btcRoc5  = btcCandles && btcCandles.length >= 6
+          ? Math.abs((btcCandles[btcCandles.length-1].close - btcCandles[btcCandles.length-6].close)
+            / btcCandles[btcCandles.length-6].close * 100) : 0;
+        const rsAlpha     = c.isBull ? (coinRoc5 - btcRoc5) : (btcRoc5 - coinRoc5);
+        const hasRSLead   = rsAlpha > 0.5;   // coin clearly outperforming BTC
+        const hasStrongRS = rsAlpha > 2.0;   // coin massively outperforming
+
+        // ── Volume acceleration from Phase 1 & Phase 2 ──
+        // Phase 1 volAccel (selected TF, from klines)
+        const p1Accel  = c.volAccel  || { powerLevel:'NONE', accelerationRatio:0 };
+        // Phase 2 volAccel (from structure candles — same TF, more candles = more accurate)
+        const p2Accel  = c.volAccel2 || { powerLevel:'NONE', accelerationRatio:0 };
+        // Use the stronger of the two
+        const bestAccelRatio = Math.max(p1Accel.accelerationRatio||0, p2Accel.accelerationRatio||0);
+        const bestPowerLevel = bestAccelRatio >= 2.5 ? 'IGNITION'
+          : bestAccelRatio >= 1.5 ? 'FUELING'
+          : p1Accel.isAccelerating || p2Accel.isAccelerating ? 'BUILDING' : 'NONE';
+
+        // Liquidity void — expansion candle (from Phase 1 or Phase 2)
+        const hasVoid = c.hasLiqVoid || (c.liqVoid2 && c.liqVoid2.hasVoid);
+
         let conviction=40;
         if (c.rvolPass)   conviction+=8;
         if (c.rocPass)    conviction+=5;
@@ -264,17 +383,45 @@ async function phase3_confluence(structQualified, tf) {
         if (c.hasDirFVG)  conviction+=8;
         if (c.hasSweep)   conviction+=6;
         if (c.hasLiq)     conviction+=4;
+
+        // OI
         if (oiSupports) {
           conviction+=(oiDirection==='strong_long'||oiDirection==='strong_short')?10:4;
         } else { conviction-=8; }
         if (lsRatio>1.5  &&!c.isBull) conviction+=6;
         if (lsRatio<0.67 && c.isBull) conviction+=6;
         if (btcPass) conviction+=5; else conviction-=10;
-        conviction=Math.max(30,Math.min(98,Math.round(conviction)));
 
+        // RS Alpha scoring
+        if (hasStrongRS) conviction+=12;
+        else if (hasRSLead) conviction+=6;
+
+        // Volume acceleration scoring
+        if (bestPowerLevel==='IGNITION') conviction+=15;
+        else if (bestPowerLevel==='FUELING') conviction+=8;
+        else if (bestPowerLevel==='BUILDING') conviction+=3;
+
+        // Liquidity void (expansion candle = sellers/buyers cleared)
+        if (hasVoid) conviction+=7;
+
+        conviction=Math.max(30,Math.min(98,Math.round(conviction)));
         if (conviction<55) return;
 
+        // Build RS + ignition reasons
+        if (hasStrongRS)
+          c.reasons.push(`RS Alpha +${rsAlpha.toFixed(1)}% vs BTC — strong institutional outperformance`);
+        else if (hasRSLead)
+          c.reasons.push(`RS Alpha +${rsAlpha.toFixed(1)}% vs BTC — coin outperforming market`);
+        if (bestPowerLevel==='IGNITION')
+          c.reasons.push(`Volume IGNITION — 3-candle acceleration ratio ${bestAccelRatio.toFixed(1)}x, sellers cleared`);
+        else if (bestPowerLevel==='FUELING')
+          c.reasons.push(`Volume FUELING — acceleration ratio ${bestAccelRatio.toFixed(1)}x, momentum building`);
+        if (hasVoid)
+          c.reasons.push('Expansion candle detected — liquidity void above, no supply resistance');
+
         final.push({ ...c, conviction, oiDirection, lsRatio, btcRoc,
+          rsAlpha, hasRSLead, hasStrongRS,
+          bestPowerLevel, bestAccelRatio, hasVoid,
           allReasons:[...(c.reasons||[]),...[oiReason,lsReason,btcReason].filter(Boolean)] });
       } catch(e) {}
     }));
@@ -338,6 +485,25 @@ function renderBubbles(signals) {
     .attr('stroke', d=>getStrokeColor(d))
     .attr('stroke-width',1.5);
 
+  // IGNITION pulse ring — animated outer ring for highest conviction launches
+  node.filter(d => d.bestPowerLevel === 'IGNITION')
+    .append('circle')
+    .attr('class','ignition-ring')
+    .attr('r', d=>d.r+4)
+    .attr('fill','none')
+    .attr('stroke', d=>d.isBull?'rgba(0,230,118,0.6)':'rgba(255,68,68,0.6)')
+    .attr('stroke-width',2)
+    .attr('stroke-dasharray','4 3');
+
+  // FUELING outer ring — static, subtler
+  node.filter(d => d.bestPowerLevel === 'FUELING')
+    .append('circle')
+    .attr('r', d=>d.r+3)
+    .attr('fill','none')
+    .attr('stroke', d=>d.isBull?'rgba(0,230,118,0.3)':'rgba(255,68,68,0.3)')
+    .attr('stroke-width',1)
+    .attr('stroke-dasharray','2 4');
+
   node.append('text').attr('class','bubble-symbol')
     .attr('dy', d=>d.r>55?'-10':'0')
     .attr('font-size', d=>Math.max(10,Math.min(18,d.r*0.38)))
@@ -364,7 +530,14 @@ function renderBubbles(signals) {
       const convEl = tooltip.querySelector('.mit-tt-conviction');
       convEl.textContent = 'Conviction: '+d.conviction+'%';
       convEl.style.color = d.isBull?'#00e676':'#ff4444';
-      tooltip.querySelector('.mit-tt-setup').textContent = d.setupType||'';
+
+      // Power level badge
+      const setupEl = tooltip.querySelector('.mit-tt-setup');
+      let setupText = d.setupType||'';
+      if (d.bestPowerLevel==='IGNITION') setupText += '  ⚡ IGNITION';
+      else if (d.bestPowerLevel==='FUELING') setupText += '  🔥 FUELING';
+      if (d.hasStrongRS) setupText += '  ★ RS LEAD';
+      setupEl.textContent = setupText;
       tooltip.querySelector('.mit-tt-reasons').innerHTML =
         (d.allReasons||[]).slice(0,4).map(r=>`<div class="mit-tt-reason">${r}</div>`).join('');
 
