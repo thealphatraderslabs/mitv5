@@ -1591,3 +1591,13 @@ body{
   letter-spacing:0.08em;text-align:center;
   padding-top:6px;border-top:1px solid var(--border);
 }
+
+/* ── MIT SCAN — Ignition ring pulse animation ── */
+@keyframes ignition-spin {
+  from { stroke-dashoffset: 0; }
+  to   { stroke-dashoffset: -28; }
+}
+.ignition-ring {
+  animation: ignition-spin 1.2s linear infinite;
+  transform-origin: center;
+}
